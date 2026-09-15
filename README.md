@@ -20,7 +20,6 @@ To successfully build and run this package, ensure the following dependencies ar
 
 **Custom Workspace Packages:**
 * `common_msgs`
-* `node_metrics_monitor`
   
 ## How to Run
 
