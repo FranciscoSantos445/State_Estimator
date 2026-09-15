@@ -7,6 +7,10 @@ I would like to express my gratitude to Nuno Alexandre, who pioneered the develo
 ## Dependencies
 To successfully build and run this package, ensure the following dependencies are installed or present in your catkin workspace:
 
+**Required:**
+* ROS Noetic
+* A C++ compiler (C++11 or newer)
+
 **System / External Libraries:**
 * `roscpp`
 * `Eigen3` 
@@ -17,9 +21,6 @@ To successfully build and run this package, ensure the following dependencies ar
 * `sensor_msgs`
 * `geometry_msgs`
 * `nav_msgs`
-
-**Custom Workspace Packages:**
-* `common_msgs`
   
 ## How to Run
 
