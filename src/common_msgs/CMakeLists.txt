@@ -11,6 +11,7 @@ add_message_files(
   FILES
   CarAcceleration.msg
   CarMotor.msg
+  CarPose.msg
   CarTireInfo.msg
   CarVelocity.msg
   ControlCmd.msg

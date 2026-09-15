@@ -3,7 +3,6 @@ project(state_estimation)
 
 ## Compile as C++11, supported in ROS Kinetic and newer
 # add_compile_options(-std=c++11)
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3 -march=native -DNDEBUG")
 
 ## Find catkin macros and libraries
 ## if COMPONENTS list like find_package(catkin REQUIRED COMPONENTS xyz)
@@ -20,10 +19,9 @@ find_package(catkin REQUIRED COMPONENTS
   common_msgs
 )
 
-find_package(Eigen3 REQUIRED)
-
 ## System dependencies are found with CMake's conventions
 # find_package(Boost REQUIRED COMPONENTS system)
+find_package(Eigen3 REQUIRED)
 
 
 ## Uncomment this if the package has a setup.py. This macro ensures
@@ -216,7 +214,7 @@ include_directories(
 # catkin_add_nosetests(test)
 
 add_executable(
-  ${PROJECT_NAME}_state_estimation src/state_estimation_main.cpp src/state_estimation_handle.cpp src/state_estimation_pipeline.cpp src/state_estimation_ukf.cpp src/state_estimation_lugre.cpp
+  ${PROJECT_NAME}_state_estimation src/state_estimation_main.cpp src/state_estimation_handle.cpp src/state_estimation_pipeline.cpp src/state_estimation_ekf.cpp src/state_estimation_lugre.cpp
 )
 set_target_properties(
   ${PROJECT_NAME}_state_estimation PROPERTIES OUTPUT_NAME state_estimation PREFIX ""

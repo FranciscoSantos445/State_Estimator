@@ -11,21 +11,10 @@ StateEstimation::StateEstimation(ros::NodeHandle &nh) {
 
     _gpsCoordinates.setZero();
     _gpsCoordinatesConverted.setZero();
-
-    _lastUpdateTime = ros::Time::now();
 }
 
 void StateEstimation::run() {
-
     _kalmanFilter.update();
-
-    // Accumulate distance travelled from the UKF velocity, used to gate when _initialYaw latches
-    const Eigen::Matrix<double,UKF_CONFIG::N,1> x = _kalmanFilter.getStateVector();
-    const double dt = _kalmanFilter._currentTimeStamp.toSec() - _lastUpdateTime.toSec();
-    _lastUpdateTime = _kalmanFilter._currentTimeStamp;
-    if (dt > 0.0 && dt < 1.0) {
-        _distanceIncrement += std::hypot(x(12), x(13)) * dt;
-    }
 }
 
 void StateEstimation::loadCarParameters(ros::NodeHandle &nh) {
@@ -41,6 +30,7 @@ void StateEstimation::loadCarParameters(ros::NodeHandle &nh) {
     _params.aero.rho = nh.param<double>("car/aero/rho", 0);
     _params.aero.cl = nh.param<double>("car/aero/cl", 0);
     _params.aero.dist = nh.param<double>("car/aero/dist", 0);
+    _params.aero.cd = nh.param<double>("car/aero/cd", 0);
 
     //Load Kinematics Params
     _params.kinematics.track = nh.param<double>("car/kinematics/track", 0);
@@ -128,14 +118,13 @@ void StateEstimation::loadEkfParameters(ros::NodeHandle &nh) {
 
     //Load Lugre EKF Config
     nh.getParam("/state_estimation/lugre_ekf/initial_estimate_covariance", covarConfig);
-    convertXMLRPCVector(P, covarConfig, UKF_CONFIG::N);
+    convertXMLRPCVector(P, covarConfig, 15);
 
     nh.getParam("/state_estimation/lugre_ekf/process_covariance", covarConfig);
-    convertXMLRPCVector(Q, covarConfig, UKF_CONFIG::N);
+    convertXMLRPCVector(Q, covarConfig, 15);
 
     nh.getParam("/state_estimation/lugre_ekf/measurement_covariance", covarConfig);
-    convertXMLRPCVector(R, covarConfig, UKF_CONFIG::M);
-
+    convertXMLRPCVector(R, covarConfig, 9);
 
     if (!_use_gps_velocities) {
         R(6, 6) = 10000.0; // GPS v_x
@@ -144,28 +133,6 @@ void StateEstimation::loadEkfParameters(ros::NodeHandle &nh) {
 
     //Parse the matrices to kalman object
     _kalmanFilter.loadCovarianceMatrices(P,Q,R);
-}
-
-void StateEstimation::predictYaw(double wz, double dt) {
-    _yawHat = clampAnglePi2Pi(_yawHat + (wz - _gyroBiasHat) * dt);
-}
-
-void StateEstimation::correctYawXsens(double xsensYaw) {
-    double meas = clampAnglePi2Pi(xsensYaw - _initialYaw);
-    double innov = clampAnglePi2Pi(meas - _yawHat);
-    _yawHat = clampAnglePi2Pi(_yawHat + _kXsensYaw * innov);
-    _gyroBiasHat -= _kXsensBias * innov;
-}
-
-void StateEstimation::correctYawGpsCog(double vMapX, double vMapY, double speed) {
-    if (speed < _cogSpeedThresh) return;
-    double cog = std::atan2(vMapY, vMapX); // already in the _initialYaw-relative map frame
-    double beta = std::atan2(_x(13), _x(12)); // sideslip from UKF vy, vx
-    double meas = clampAnglePi2Pi(cog - beta);
-    double fusedYaw = clampAnglePi2Pi(_yawHat + _yawOffsetHat);
-    double innov = clampAnglePi2Pi(meas - fusedYaw);
-    // only touches the offset state, not _yawHat (see header comment)
-    _yawOffsetHat = clampAnglePi2Pi(_yawOffsetHat + _kYawOffset * innov);
 }
 
 void StateEstimation::convertGpsCoordinates() {
@@ -177,6 +144,7 @@ void StateEstimation::convertGpsCoordinates() {
         // Correct Flat-Earth Projection
         _gpsCoordinatesConverted(0) = arc * cosf(_gpsInitial(0) * M_PI / 180.0) * (_gpsCoordinates(1) - _gpsInitial(1));
         _gpsCoordinatesConverted(1) = arc * (_gpsCoordinates(0) - _gpsInitial(0));
+
     
         Eigen::Matrix<double,2,2> rotation;
         float angle = _initialYaw;
@@ -184,32 +152,28 @@ void StateEstimation::convertGpsCoordinates() {
                    -sinf(angle), cosf(angle);
 
         _gpsCoordinatesConverted.block<2,1>(0,0) = rotation * _gpsCoordinatesConverted.block<2,1>(0,0);
-        _gpsCoordinatesConverted(2) = clampAnglePi2Pi(_yawHat + _yawOffsetHat);
+        _gpsCoordinatesConverted(2) = clampAnglePi2Pi(_currentXsensYaw - _initialYaw);
     }
 }
 
-// This gives us position of the car, in global coordinates. Velocity comes straight from
-// the UKF's own vx/vy states (dead reckoning, no GPS position feedback); heading uses the
-// yaw observer's corrected estimate (_yawHat + _yawOffsetHat: gyro bias removed, pulled to
-// Xsens absolute yaw, and to GPS course-over-ground above _cogSpeedThresh) instead of a
-// free-running integration of raw yaw rate, which is what used to make this drift.
+// This gives us position in the car frame, in global coordinates
 sensor_msgs::NavSatFix StateEstimation::getPureNavSatFix() {
-
+    
     sensor_msgs::NavSatFix nav_msg;
-
+    
     _x = _kalmanFilter.getStateVector();
     ros::Time currentTime = _kalmanFilter._currentTimeStamp;
 
     nav_msg.header.stamp = currentTime;
-    nav_msg.header.frame_id = "map";
-
-    // Wait for the yaw observer to latch (same 7m gate as _initialYaw)
-    if (!_yawFilterInitialized) {
+    nav_msg.header.frame_id = "map"; 
+    
+    // Wait for initial yaw to be set
+    if (_initialYaw == 0) {
         nav_msg.latitude = _gpsCoordinates(0);
         nav_msg.longitude = _gpsCoordinates(1);
         nav_msg.altitude = _gpsCoordinates(2);
         _lastKekfTime = currentTime;
-        return nav_msg;
+        return nav_msg; 
     }
 
     constexpr double EARTH_RADIUS = 6378388.0;
@@ -218,10 +182,12 @@ sensor_msgs::NavSatFix StateEstimation::getPureNavSatFix() {
     if (!_pureNavInitialized) {
         _anchorLat = _gpsCoordinates(0);
         _anchorLon = _gpsCoordinates(1);
-
+        
+        // Start at Local (0,0) with initial yaw
+        _rawYaw = _initialYaw;
         _rawX = 0.0;
         _rawY = 0.0;
-
+        
         _lastKekfTime = currentTime;
         _pureNavInitialized = true;
     }
@@ -229,20 +195,20 @@ sensor_msgs::NavSatFix StateEstimation::getPureNavSatFix() {
     const double dt = currentTime.toSec() - _lastKekfTime.toSec();
     _lastKekfTime = currentTime;
 
+    // Extract velocities from the state vector
     double vx = _x(12);
     double vy = _x(13);
+    double wz = _x(14); 
+    
+    _rawYaw += wz * dt;
 
-    // absolute heading, starts at _initialYaw (not 0) to match the map frame set up in convertGpsCoordinates()
-    double yaw = clampAnglePi2Pi(_yawHat + _yawOffsetHat + _initialYaw);
+    double global_vx = vx * cos(_rawYaw) - vy * sin(_rawYaw); 
+    double global_vy = vx * sin(_rawYaw) + vy * cos(_rawYaw); 
 
-    // transform velocities from car frame to global frame
-    double global_vx = vx * cos(yaw) - vy * sin(yaw); // East
-    double global_vy = vx * sin(yaw) + vy * cos(yaw); // North
+    _rawX += global_vx * dt; 
+    _rawY += global_vy * dt; 
 
-    _rawX += global_vx * dt; // East displacement in meters
-    _rawY += global_vy * dt; // North displacement in meters
-
-    // Convert to Lat/Lon
+    // Convert back to GPS coordinates
     double lat = (_rawY / arc) + _anchorLat;
     double lon = (_rawX / (arc * cosf(_anchorLat * M_PI / 180.0))) + _anchorLon;
 
@@ -287,7 +253,8 @@ void StateEstimation::setImuMeasure(const sensor_msgs::Imu &odom3d) {
         filtered_imu.angular_velocity.z = median_filter_scalar(_IMU_BUFFER_wz, filtered_imu.angular_velocity.z, _IMU_window_size);
     }
 
-    _wz = filtered_imu.angular_velocity.z;
+    // Update accelerations
+    _kalmanFilter.updateInertia(filtered_imu.linear_acceleration.x, filtered_imu.linear_acceleration.y, filtered_imu.angular_velocity.z);
 
     // FOR GPS
     tf2::Quaternion q(odom3d.orientation.x, odom3d.orientation.y, odom3d.orientation.z, odom3d.orientation.w);
@@ -298,28 +265,26 @@ void StateEstimation::setImuMeasure(const sensor_msgs::Imu &odom3d) {
 
     m.getRPY(Roll, Pitch, Yaw);
 
-    if (_initialYaw == 0 && _distanceIncrement >= 7.0) {
-        _initialYaw = Yaw;
-        _yawHat = 0.0;
-        _yawOffsetHat = 0.0;
-        _gyroBiasHat = 0.0;
-        _yawFilterInitialized = true;
-        _lastYawPredictTime = odom3d.header.stamp;
+    // To smooth out the initial yaw, we will wait until the car has moved a certain distance before setting the initial yaw, once setted this stops doing anything 
+    if (!_distanceIncrementDone) {
+        const ros::Time currentTime = odom3d.header.stamp;
+        if (!_lastDistanceUpdateTime.isZero()) {
+            const double dt = (currentTime - _lastDistanceUpdateTime).toSec();
+
+            // ensure that dt is positive and reasonable
+            if (dt > 0.0 && dt < 1.0) {
+                const Eigen::Matrix<double,15,1> x = _kalmanFilter.getStateVector();
+                _distanceIncrement += std::hypot(x(12), x(13)) * dt;
+            }
+        }
+        _lastDistanceUpdateTime = currentTime;
+
+        if (_distanceIncrement >= 4.0) {
+            _initialYaw = Yaw;
+            _distanceIncrementDone = true;
+        }
     }
     _currentXsensYaw = Yaw;
-
-    if (_yawFilterInitialized) {
-        double yawDt = (odom3d.header.stamp - _lastYawPredictTime).toSec();
-        _lastYawPredictTime = odom3d.header.stamp;
-        if (yawDt > 0.0 && yawDt < 1.0) {
-            predictYaw(_wz, yawDt);
-        }
-        correctYawXsens(Yaw);
-    }
-
-    // feed the bias corrected rate to the UKF instead of raw gyro (bias comes from correctYawXsens)
-    // hurts NEES on speed (44 -> 66) but signals still look fine, leaving it for now, fix another day
-    _kalmanFilter.updateInertia(filtered_imu.linear_acceleration.x, filtered_imu.linear_acceleration.y, _wz - _gyroBiasHat);
 }
 
 void StateEstimation::setWheelSpeedsMeasure(const common_msgs::CarMotor &wheel_speeds){
@@ -337,25 +302,30 @@ void StateEstimation::setWheelSpeedsMeasure(const common_msgs::CarMotor &wheel_s
         filtered.value3 = median_filter_scalar(_WheelSpeeds3_BUFFER, filtered.value3, _WheelSpeeds_window_size);
     }
 
-    double w_fl = filtered.value0*M_PI/30.0/_params.engine.gr;
-    _kalmanFilter.updateWheelSpeedsFL(w_fl);
-    //DEBUG
-    _wheelSpeedsVector(0) = w_fl;
-
-    double w_fr = filtered.value1*M_PI/30.0/_params.engine.gr;
-    _kalmanFilter.updateWheelSpeedsFR(w_fr);
-    //DEBUG
-    _wheelSpeedsVector(1) = w_fr;
-
-    double w_rl = filtered.value2*M_PI/30.0/_params.engine.gr;
-    _kalmanFilter.updateWheelSpeedsRL(w_rl);
-    //DEBUG
-    _wheelSpeedsVector(2) = w_rl;
-
-    double w_rr = filtered.value3*M_PI/30.0/_params.engine.gr;
-    _kalmanFilter.updateWheelSpeedsRR(w_rr);
-    //DEBUG
-    _wheelSpeedsVector(3) = w_rr;
+    if(filtered.value0 < 30000 ) {
+        double w_fl = filtered.value0*M_PI/30.0/_params.engine.gr;
+        _kalmanFilter.updateWheelSpeedsFL(w_fl);
+        //DEBUG
+        _wheelSpeedsVector(0) = w_fl;
+    }
+    if (filtered.value1 < 30000) {
+        double w_fr = filtered.value1*M_PI/30.0/_params.engine.gr;
+        _kalmanFilter.updateWheelSpeedsFR(w_fr);
+        //DEBUG
+        _wheelSpeedsVector(1) = w_fr;
+    }
+    if (filtered.value2 < 30000) {
+        double w_rl = filtered.value2*M_PI/30.0/_params.engine.gr;
+        _kalmanFilter.updateWheelSpeedsRL(w_rl);
+        //DEBUG
+        _wheelSpeedsVector(2) = w_rl;
+    }
+    if (filtered.value3 < 30000) {
+        double w_rr = filtered.value3*M_PI/30.0/_params.engine.gr;
+        _kalmanFilter.updateWheelSpeedsRR(w_rr);
+        //DEBUG
+        _wheelSpeedsVector(3) = w_rr;
+    }
 }
 
 void StateEstimation::setTorqueMeasure(const common_msgs::CarMotor &torque){
@@ -376,7 +346,6 @@ void StateEstimation::setTorqueMeasure(const common_msgs::CarMotor &torque){
     double u_rl = filtered.value2*_params.engine.gr*0.001 * M_PI/2.0;
     double u_rr = filtered.value3*_params.engine.gr*0.001 * M_PI/2.0;
     _kalmanFilter.updateMotorTorque(u_fl, u_fr, u_rl,u_rr);
-
     //DEBUG
     _torqueVector(0) = u_fl;
     _torqueVector(1) = u_fr;
@@ -392,17 +361,13 @@ void StateEstimation::setSteeringMeasure(const common_msgs::ControlCmd &steering
     //max dash is around 100 degrees, max at the wheel is around 20 degrees (fst13)
 
     // Value for fst 15
-    const double steering_ratio = 4.98; // pass this to a config value
+    const double steering_ratio = 4.96;
 
     double wheel_st = -steering.steering_angle*(M_PI/180)/(10*steering_ratio);
     
     //true if turning left
     bool steering_bool = (wheel_st > 0) ? 1.0 : -1.0;
     //if turning left, left (inner) wheel turns more than right (outer) wheel
-
-    // Updated linear regression based on new fst 15
-    // double steering_fl = steering_bool ? (1.0599 * wheel_st) : (0.9355 * wheel_st);
-    // double steering_fr = steering_bool ? (0.9355 * wheel_st) : (1.0599 * wheel_st);
 
     const std::vector<float> coef_inside  = {6e-5f, 0.1893f};
     const std::vector<float> coef_outside = {-0.0002f, 0.1874f};
@@ -435,46 +400,58 @@ void StateEstimation::setGpsPosition(const sensor_msgs::NavSatFix &gpsPosition) 
     }
     convertGpsCoordinates();
 
-    // map-frame velocity from position diff, feeds the yaw observer's COG correction
-    // and, if enabled, the GPS velocity update to the UKF
-    if (_isGpsInitForVelocity) {
-        double dt = (gpsPosition.header.stamp - _lastGpsStamp).toSec();
+    // Should probably just use the GPS velocity but bags only have the GPS position recorded
+    if(_use_gps_velocities){
 
-        // Temporal throttling to prevent noise amplification
-        if (dt >= _minGpsDt) {
-            // Calculate global map frame velocity
-            double v_global_x = (_gpsCoordinatesConverted(0) - _lastGpsX) / dt;
-            double v_global_y = (_gpsCoordinatesConverted(1) - _lastGpsY) / dt;
-            double speed = std::hypot(v_global_x, v_global_y);
-
-            correctYawGpsCog(v_global_x, v_global_y, speed);
-
-            if (_use_gps_velocities) {
-                // Rotate into vehicle body frame using the fused yaw
+        if (_isGpsInitForVelocity) {
+            double dt = (gpsPosition.header.stamp - _lastGpsStamp).toSec();
+        
+            if (dt >= _minGpsDt) {
+                // Calculate global map frame velocity
+                double v_global_x = (_gpsCoordinatesConverted(0) - _lastGpsX) / dt;
+                double v_global_y = (_gpsCoordinatesConverted(1) - _lastGpsY) / dt;
+                
+                // Rotate into vehicle body frame using current yaw
                 double theta = _gpsCoordinatesConverted(2);
                 double v_body_x = v_global_x * std::cos(theta) + v_global_y * std::sin(theta);
                 double v_body_y = -v_global_x * std::sin(theta) + v_global_y * std::cos(theta);
+                
+                _filteredGpsVx = v_body_x;
+                _filteredGpsVy = v_body_y;
 
                 // Update the Kalman Filter directly
-                _kalmanFilter.updateGpsVelocity(v_body_x, v_body_y);
-            }
+                _kalmanFilter.updateGpsVelocity(_filteredGpsVx, _filteredGpsVy);
 
-            // Update persistent state
+                // Update persistent state
+                _lastGpsStamp = gpsPosition.header.stamp;
+                _lastGpsX = _gpsCoordinatesConverted(0);
+                _lastGpsY = _gpsCoordinatesConverted(1);
+            }
+        } else {
+            _isGpsInitForVelocity = true;
             _lastGpsStamp = gpsPosition.header.stamp;
             _lastGpsX = _gpsCoordinatesConverted(0);
             _lastGpsY = _gpsCoordinatesConverted(1);
         }
-    } else {
-        _isGpsInitForVelocity = true;
-        _lastGpsStamp = gpsPosition.header.stamp;
-        _lastGpsX = _gpsCoordinatesConverted(0);
-        _lastGpsY = _gpsCoordinatesConverted(1);
     }
 }
 
 void StateEstimation::setGpsVelocity(const geometry_msgs::TwistWithCovarianceStamped &gpsVelocity) {
     //Xsens Vy seems to be inverted in relation to the YR
     _kalmanFilter.updateGpsVelocity(gpsVelocity.twist.twist.linear.x, -gpsVelocity.twist.twist.linear.y);
+}
+
+void StateEstimation::setStaSteering(const common_msgs::StaPositionInfo &steering) {
+    
+    //Sta Steering is inverted in relation to the dash,
+    //If the signal is not inverted, vy gives poor results
+
+    double wheel_st = steering.steeringEncoderSTA;
+    double steering_fr = atanf(1.0/(1.0/(tanf(wheel_st)) + (_params.kinematics.track/2.0)/(_params.kinematics.a + _params.kinematics.b)));
+    double steering_fl = atanf(1.0/(1.0/(tanf(wheel_st)) - (_params.kinematics.track/2.0)/(_params.kinematics.a + _params.kinematics.b)));
+    // DEBUG
+    _staSteeringVector(0) = steering_fl;
+    _staSteeringVector(1) = steering_fr;
 }
 
 //Getters
@@ -487,6 +464,47 @@ common_msgs::CarVelocity StateEstimation::getCarVelocity() {
     _carVelocity.velocity.y = _x(13);
     _carVelocity.velocity.theta = _x(14);
     return _carVelocity; 
+}
+
+////////////////////// Control EV ////////////////////////
+std_msgs::Float64 StateEstimation::getVelocityX() { 
+
+    //Update State Vector
+    _x = _kalmanFilter.getStateVector();
+    
+    // Create covariance message for velocity X
+    _velocityXMsg.data = _x(12);
+    return _velocityXMsg; 
+}
+
+std_msgs::Float64 StateEstimation::getVelocityY() { 
+    //Update State Vector
+    _x = _kalmanFilter.getStateVector();
+    
+    // Create covariance message for velocity Y
+    _velocityYMsg.data = _x(13);
+    return _velocityYMsg; 
+}
+
+std_msgs::Float64 StateEstimation::getVelocityTheta() { 
+    //Update State Vector
+    _x = _kalmanFilter.getStateVector();
+    
+    // Create covariance message for velocity Theta (yaw rate)
+    _velocityThetaMsg.data = _x(14);
+    return _velocityThetaMsg; 
+}
+///////////////////////////////////////////////////////
+
+common_msgs::CarAcceleration StateEstimation::getCarAcc() {
+
+    //Create Acceleration Message
+    _carAcc.header.stamp = ros::Time::now();
+    _carAcc.header.frame_id = _velocityFrameId;
+    _carAcc.x = _y_hat(4);
+    _carAcc.y = _y_hat(5);
+    _carAcc.theta = _y_hat(8);
+    return _carAcc; 
 }
 
 common_msgs::CarTireInfo StateEstimation::getCarTireInfo() {
@@ -517,7 +535,21 @@ common_msgs::TireInfo StateEstimation::convertToTireInfoMsg(TireInfoStruct tire)
     return msg;
 }
 
-std_msgs::Float32 StateEstimation::getPMatrixTrace() {
+common_msgs::CarVelocity StateEstimation::getPCarVelocity() {
+
+    //Update Covariance Matrix
+    _P = _kalmanFilter.getStateCovariance();
+    
+    //Create Velocity Message
+    _PcarVelocity.header.stamp = ros::Time::now();
+    _PcarVelocity.header.frame_id = _velocityFrameId;
+    _PcarVelocity.velocity.x = _P(12,12);
+    _PcarVelocity.velocity.y = _P(13,13);
+    _PcarVelocity.velocity.theta = _P(14,14);
+    return _PcarVelocity; 
+}
+
+std_msgs::Float32 StateEstimation::getPMatrixTrace() { 
 
     //Update Covariance Matrix
     _P = _kalmanFilter.getStateCovariance();
@@ -527,55 +559,24 @@ std_msgs::Float32 StateEstimation::getPMatrixTrace() {
     return _traceP;
 }
 
-// Checking determinant of P matrix gives more information about uncertainty than trace, since we are interested 
-// in the volume of the uncertainty
-std_msgs::Float32 StateEstimation::getPMatrixDet() {     
+common_msgs::CarMotor StateEstimation::getPMatrixWheelSpeeds() {
 
     //Update Covariance Matrix
     _P = _kalmanFilter.getStateCovariance();
 
-    // Create Determinant Message
-    _detP.data = static_cast<float>(_P.determinant());
-    return _detP;
+    //Create Velocity Message
+    _PWheelSpeeds.header.stamp = ros::Time::now();
+    _PWheelSpeeds.header.frame_id = _velocityFrameId;
+    _PWheelSpeeds.value0 = _P(2,2);
+    _PWheelSpeeds.value1 = _P(5,5);
+    _PWheelSpeeds.value2 = _P(8,8);
+    _PWheelSpeeds.value3 = _P(11,11);
+    return _PWheelSpeeds; 
 }
 
-// Row-major flatten of the full N x N state covariance, for exact (non-diagonal-approximated) NEES in post-processing
-std_msgs::Float64MultiArray StateEstimation::getStateCovarianceFull() {
-    _P = _kalmanFilter.getStateCovariance();
-
-    std_msgs::Float64MultiArray msg;
-    msg.data.resize(UKF_CONFIG::N * UKF_CONFIG::N);
-    for (int i = 0; i < UKF_CONFIG::N; ++i) {
-        for (int j = 0; j < UKF_CONFIG::N; ++j) {
-            msg.data[i * UKF_CONFIG::N + j] = _P(i, j);
-        }
-    }
-    return msg;
-}
-
-std_msgs::Float64MultiArray StateEstimation::getInnovation() {
-    const Eigen::Matrix<double, UKF_CONFIG::M, 1> innovation = _kalmanFilter.getInnovation();
-
-    std_msgs::Float64MultiArray msg;
-    msg.data.resize(UKF_CONFIG::M);
-    for (int i = 0; i < UKF_CONFIG::M; ++i) {
-        msg.data[i] = innovation(i);
-    }
-    return msg;
-}
-
-// Row-major flatten of the full M x M innovation covariance (Pyy) actually used for the Kalman gain, for NIS
-std_msgs::Float64MultiArray StateEstimation::getInnovationCovarianceFull() {
-    const Eigen::Matrix<double, UKF_CONFIG::M, UKF_CONFIG::M> Pyy = _kalmanFilter.getInnovationCovariance();
-
-    std_msgs::Float64MultiArray msg;
-    msg.data.resize(UKF_CONFIG::M * UKF_CONFIG::M);
-    for (int i = 0; i < UKF_CONFIG::M; ++i) {
-        for (int j = 0; j < UKF_CONFIG::M; ++j) {
-            msg.data[i * UKF_CONFIG::M + j] = Pyy(i, j);
-        }
-    }
-    return msg;
+std_msgs::Float32 StateEstimation::getVelocityKph() {
+    _velocityKph.data = std::hypot(_x(12), _x(13));
+    return _velocityKph;
 }
 
 geometry_msgs::Vector3Stamped StateEstimation::getSteering() {
@@ -603,6 +604,16 @@ common_msgs::StateVector StateEstimation::getTorque() {
     return state;
 }
 
+common_msgs::CarPose StateEstimation::getGpsPositionConverted() {
+
+    _gpsPosition.header.stamp = ros::Time::now();
+    _gpsPosition.header.frame_id = "map";
+    _gpsPosition.x = _gpsCoordinatesConverted(0);
+    _gpsPosition.y = _gpsCoordinatesConverted(1);
+    _gpsPosition.theta = _gpsCoordinatesConverted(2);
+    return _gpsPosition;
+}
+
 nav_msgs::Odometry StateEstimation::getGpsPositionOdometry() {
     _gpsOdom.header.stamp = ros::Time::now();
     _gpsOdom.header.frame_id = "map";
@@ -616,10 +627,19 @@ nav_msgs::Odometry StateEstimation::getGpsPositionOdometry() {
     return _gpsOdom;
 }
 
+geometry_msgs::Vector3Stamped StateEstimation::getStaSteering() {
+    _steering.header.stamp = ros::Time::now();
+    _steering.header.frame_id = _velocityFrameId;
+    _steering.vector.x = _staSteeringVector(0);
+    _steering.vector.y = _staSteeringVector(1);
+    return _steering; 
+}
+
 common_msgs::StateVector StateEstimation::get_pipeline_StateVector(){
 
     // get only important states, forces are hard to evaluate therefore are not included
     _x = _kalmanFilter.getStateVector();
+
     common_msgs::StateVector state;
 
     state.wfl = _x(2);
@@ -677,4 +697,54 @@ common_msgs::StateVector StateEstimation::getPredictedValues() {
     state.wz =  _y_hat(8);
     
     return state;
+}
+
+// State covariance matrix 
+std_msgs::Float64MultiArray StateEstimation::getStateCovarianceFull() {
+    _P = _kalmanFilter.getStateCovariance();
+
+    std_msgs::Float64MultiArray msg;
+    msg.data.resize(15 * 15);
+    for (int i = 0; i < 15; ++i) {
+        for (int j = 0; j < 15; ++j) {
+            msg.data[i * 15 + j] = _P(i, j);
+        }
+    }
+    return msg;
+}
+
+// Innovation matrix 
+std_msgs::Float64MultiArray StateEstimation::getInnovation() {
+    const Eigen::Matrix<double,9,1> innovation = _kalmanFilter.getInnovation();
+
+    std_msgs::Float64MultiArray msg;
+    msg.data.resize(9);
+    for (int i = 0; i < 9; ++i) {
+        msg.data[i] = innovation(i);
+    }
+    return msg;
+}
+
+// Innovation covariance matrix 
+std_msgs::Float64MultiArray StateEstimation::getInnovationCovarianceFull() {
+    const Eigen::Matrix<double,9,9> Pyy = _kalmanFilter.getInnovationCovariance();
+
+    std_msgs::Float64MultiArray msg;
+    msg.data.resize(9 * 9);
+    for (int i = 0; i < 9; ++i) {
+        for (int j = 0; j < 9; ++j) {
+            msg.data[i * 9 + j] = Pyy(i, j);
+        }
+    }
+    return msg;
+}
+
+common_msgs::CarVelocity StateEstimation::getCalculatedGpsVelocity() {
+    common_msgs::CarVelocity gps_vel_msg;
+    gps_vel_msg.header.stamp = _lastGpsStamp;
+    gps_vel_msg.header.frame_id = "base_link"; 
+    gps_vel_msg.velocity.x = _filteredGpsVx;
+    gps_vel_msg.velocity.y = _filteredGpsVy;
+    gps_vel_msg.velocity.theta = 0.0;
+    return gps_vel_msg;
 }

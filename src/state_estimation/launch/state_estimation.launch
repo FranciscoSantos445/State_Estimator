@@ -1,5 +1,5 @@
 <launch>
-    <node name="state_estimation" pkg="state_estimation" type="state_estimation" output="screen">
+    <node name="state_estimation" pkg="state_estimation" type="state_estimation" output="screen" >
         <rosparam command="load" file="$(find state_estimation)/config/fst15.yaml"/>
         <rosparam command="load" file="$(find state_estimation)/config/ekf_params_15.yaml"/>
     </node>

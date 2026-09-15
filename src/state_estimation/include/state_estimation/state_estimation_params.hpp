@@ -27,6 +27,7 @@ struct Aero {
     double rho;
     double cl;
     double dist;
+    double cd;
 
 };
 
@@ -56,7 +57,6 @@ struct Engine {
 };
 
 struct Tire {
-    EIGEN_MAKE_ALIGNED_OPERATOR_NEW;
     Eigen::Matrix<double,3,2> sigma;
     double J;
     Eigen::Matrix<double,2,2> mu_k;
@@ -94,7 +94,7 @@ struct Params {
     Aero aero;
 
     //Array of tires
-    std::vector<Tire, Eigen::aligned_allocator<Tire>> tireArray;;
+    std::vector<Tire> tireArray;
     Eigen::Vector4d Fn;
 };
 
